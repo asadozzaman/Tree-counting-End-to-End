@@ -1,0 +1,9 @@
+﻿# Monorepo
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.env
+.env.local
+venv/
+.venv/
