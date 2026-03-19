@@ -1,12 +1,18 @@
-﻿import os
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import psycopg2
 import psycopg2.extras
 import redis
 from ultralytics import YOLO
+
+try:
+    from app.metrics import compute_metrics
+except ModuleNotFoundError:
+    from metrics import compute_metrics
 
 
 def database_url() -> str:
@@ -25,12 +31,10 @@ def model_path() -> str:
     return os.getenv("MODEL_PATH", "/models/tree_yolo26s_best.pt")
 
 
-def infer_conf() -> float:
-    return float(os.getenv("INFER_CONF", "0.25"))
-
-
-def infer_iou() -> float:
-    return float(os.getenv("INFER_IOU", "0.45"))
+def artifacts_dir() -> Path:
+    root = Path(os.getenv("ARTIFACTS_DIR", "/shared/uploads/artifacts"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def get_job_input_asset(cur, job_id: str):
@@ -102,8 +106,7 @@ def save_detections_and_metrics(cur, job_id: str, project_id: str, asset_id: str
             ),
         )
 
-    tree_count = len(detections)
-    avg_conf = round(sum(d["confidence"] for d in detections) / tree_count, 6) if tree_count else 0.0
+    metrics = compute_metrics(detections=detections, duration_ms=duration_ms)
 
     cur.execute(
         """
@@ -115,16 +118,44 @@ def save_detections_and_metrics(cur, job_id: str, project_id: str, asset_id: str
             avg_confidence = EXCLUDED.avg_confidence,
             duration_ms = EXCLUDED.duration_ms
         """,
-        (job_id, project_id, tree_count, avg_conf, duration_ms),
+        (job_id, project_id, metrics["tree_count"], metrics["avg_confidence"], metrics["duration_ms"]),
     )
 
 
-def run_inference(model: YOLO, file_path: str) -> list:
-    result = model.predict(source=file_path, conf=infer_conf(), iou=infer_iou(), verbose=False)[0]
+def upsert_annotated_asset(cur, job_id: str, project_id: str, file_path: str) -> None:
+    p = Path(file_path)
+    size_bytes = p.stat().st_size
+    mime_type = "image/jpeg"
+    if p.suffix.lower() == ".png":
+        mime_type = "image/png"
+
+    cur.execute("DELETE FROM assets WHERE job_id=%s AND kind='annotated'", (job_id,))
+    cur.execute(
+        """
+        INSERT INTO assets(project_id, job_id, kind, file_path, mime_type, size_bytes)
+        VALUES (%s, %s, 'annotated', %s, %s, %s)
+        """,
+        (project_id, job_id, file_path, mime_type, size_bytes),
+    )
+
+
+def annotated_output_path(job_id: str) -> Path:
+    return artifacts_dir() / f"{job_id}_annotated.jpg"
+
+
+def save_annotated_image(image_bgr, target: Path) -> None:
+    ok = cv2.imwrite(str(target), image_bgr)
+    if not ok:
+        raise RuntimeError(f"Failed to write annotated image: {target}")
+
+
+def run_inference(model: YOLO, file_path: str, conf_threshold: float, iou_threshold: float):
+    result = model.predict(source=file_path, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
+    annotated_image = result.plot()
     names = result.names
     detections = []
     if result.boxes is None:
-        return detections
+        return detections, annotated_image
 
     boxes = result.boxes
     xyxy = boxes.xyxy.cpu().tolist()
@@ -145,13 +176,20 @@ def run_inference(model: YOLO, file_path: str) -> list:
             }
         )
 
-    return detections
+    return detections, annotated_image
 
 
 def process_job(conn, model: YOLO, job_id: str) -> None:
     with conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT id, project_id, status FROM jobs WHERE id=%s", (job_id,))
+            cur.execute(
+                """
+                SELECT id, project_id, status, conf_threshold, iou_threshold
+                FROM jobs
+                WHERE id=%s
+                """,
+                (job_id,),
+            )
             job = cur.fetchone()
             if not job:
                 print(f"job not found: {job_id}", flush=True)
@@ -171,8 +209,17 @@ def process_job(conn, model: YOLO, job_id: str) -> None:
         if not Path(file_path).exists():
             raise RuntimeError(f"Input file missing: {file_path}")
 
-        detections = run_inference(model, file_path)
+        conf_threshold = float(job["conf_threshold"]) if job["conf_threshold"] is not None else 0.25
+        iou_threshold = float(job["iou_threshold"]) if job["iou_threshold"] is not None else 0.45
+        detections, annotated_image = run_inference(
+            model,
+            file_path,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
         duration_ms = int((time.time() - started) * 1000)
+        annotated_path = annotated_output_path(job_id)
+        save_annotated_image(annotated_image, annotated_path)
 
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -183,6 +230,12 @@ def process_job(conn, model: YOLO, job_id: str) -> None:
                     asset_id=str(asset["id"]),
                     detections=detections,
                     duration_ms=duration_ms,
+                )
+                upsert_annotated_asset(
+                    cur=cur,
+                    job_id=job_id,
+                    project_id=str(job["project_id"]),
+                    file_path=str(annotated_path),
                 )
                 set_job_done(cur, job_id)
 

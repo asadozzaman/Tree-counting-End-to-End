@@ -33,6 +33,7 @@
     ports:
       - "8000:8000"
     volumes:
+      - ./api:/app
       - shared_uploads:/shared/uploads
     depends_on:
       postgres:
@@ -54,8 +55,9 @@
       sh -c "apt-get update &&
       apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libxcb1 &&
       rm -rf /var/lib/apt/lists/* &&
-      python app/worker.py"
+      python -m app.worker"
     volumes:
+      - ./worker:/app
       - shared_uploads:/shared/uploads
       - ./tree_yolo26s_best.pt:/models/tree_yolo26s_best.pt:ro
     depends_on:

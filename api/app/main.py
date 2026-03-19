@@ -1,4 +1,6 @@
 ﻿import os
+import csv
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator, Optional
@@ -8,7 +10,8 @@ import uuid
 import psycopg2
 import psycopg2.extras
 import redis
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -64,6 +67,50 @@ class UploadResponse(BaseModel):
     file_path: str
     mime_type: str
     size_bytes: int
+    conf_threshold: float
+    iou_threshold: float
+
+
+class DetectionResponse(BaseModel):
+    id: int
+    class_id: int
+    class_name: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    confidence: float
+    created_at: datetime
+
+
+class JobMetricsResponse(BaseModel):
+    tree_count: int
+    avg_confidence: float
+    duration_ms: int
+
+
+class JobAssetsResponse(BaseModel):
+    input_image: Optional[str] = None
+    annotated_image: Optional[str] = None
+    csv_download_url: str
+    json_download_url: str
+
+
+class JobDetailResponse(BaseModel):
+    id: UUID
+    project_id: UUID
+    status: str
+    input_type: str
+    error_message: Optional[str]
+    conf_threshold: float
+    iou_threshold: float
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    metrics: Optional[JobMetricsResponse] = None
+    detections: list[DetectionResponse] = Field(default_factory=list)
+    assets: JobAssetsResponse
 
 
 def database_url() -> str:
@@ -103,6 +150,136 @@ def uploads_dir() -> Path:
     return root
 
 
+def artifacts_dir() -> Path:
+    root = uploads_dir() / "artifacts"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def csv_artifact_path(job_id: UUID) -> Path:
+    return artifacts_dir() / f"{job_id}_detections.csv"
+
+
+def json_artifact_path(job_id: UUID) -> Path:
+    return artifacts_dir() / f"{job_id}_detections.json"
+
+
+def get_owned_job_or_404(cur, job_id: UUID, user_id: UUID):
+    cur.execute(
+        """
+        SELECT j.id, j.project_id, j.status, j.input_type, j.error_message,
+               j.conf_threshold, j.iou_threshold, j.started_at, j.completed_at,
+               j.created_at, j.updated_at
+        FROM jobs j
+        JOIN projects p ON p.id = j.project_id
+        WHERE j.id = %s AND p.user_id = %s
+        """,
+        (str(job_id), str(user_id)),
+    )
+    job = cur.fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+def fetch_job_metrics(cur, job_id: UUID):
+    cur.execute(
+        """
+        SELECT tree_count, avg_confidence, duration_ms
+        FROM job_metrics
+        WHERE job_id = %s
+        """,
+        (str(job_id),),
+    )
+    return cur.fetchone()
+
+
+def fetch_job_detections(cur, job_id: UUID):
+    cur.execute(
+        """
+        SELECT id, class_id, class_name, x1, y1, x2, y2, confidence, created_at
+        FROM detections
+        WHERE job_id = %s
+        ORDER BY id ASC
+        """,
+        (str(job_id),),
+    )
+    return cur.fetchall()
+
+
+def fetch_job_assets(cur, job_id: UUID):
+    cur.execute(
+        """
+        SELECT kind, file_path
+        FROM assets
+        WHERE job_id = %s
+        """,
+        (str(job_id),),
+    )
+    out = {"input_image": None, "annotated_image": None}
+    for row in cur.fetchall():
+        if row["kind"] == "input":
+            out["input_image"] = row["file_path"]
+        if row["kind"] == "annotated":
+            out["annotated_image"] = row["file_path"]
+    return out
+
+
+def write_detections_csv(path: Path, detections: list, metrics) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=["id", "class_id", "class_name", "x1", "y1", "x2", "y2", "confidence"],
+        )
+        writer.writeheader()
+        for d in detections:
+            writer.writerow(
+                {
+                    "id": d["id"],
+                    "class_id": d["class_id"],
+                    "class_name": d["class_name"],
+                    "x1": d["x1"],
+                    "y1": d["y1"],
+                    "x2": d["x2"],
+                    "y2": d["y2"],
+                    "confidence": d["confidence"],
+                }
+            )
+
+        writer.writerow({})
+        writer.writerow({"id": "tree_count", "class_id": metrics["tree_count"] if metrics else 0})
+        writer.writerow({"id": "avg_confidence", "class_id": metrics["avg_confidence"] if metrics else 0.0})
+        writer.writerow({"id": "duration_ms", "class_id": metrics["duration_ms"] if metrics else 0})
+
+
+def write_detections_json(path: Path, job, detections: list, metrics) -> None:
+    payload = {
+        "job": {
+            "id": str(job["id"]),
+            "project_id": str(job["project_id"]),
+            "status": job["status"],
+            "conf_threshold": float(job["conf_threshold"]) if job["conf_threshold"] is not None else 0.25,
+            "iou_threshold": float(job["iou_threshold"]) if job["iou_threshold"] is not None else 0.45,
+        },
+        "metrics": {
+            "tree_count": int(metrics["tree_count"]) if metrics else 0,
+            "avg_confidence": float(metrics["avg_confidence"]) if metrics else 0.0,
+            "duration_ms": int(metrics["duration_ms"]) if metrics else 0,
+        },
+        "detections": [
+            {
+                "id": int(d["id"]),
+                "class_id": int(d["class_id"]),
+                "class_name": str(d["class_name"]),
+                "bbox": [float(d["x1"]), float(d["y1"]), float(d["x2"]), float(d["y2"])],
+                "conf": float(d["confidence"]),
+            }
+            for d in detections
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def validate_upload(file: UploadFile, size_bytes: int) -> None:
     allowed_mime = {"image/jpeg", "image/png"}
     allowed_ext = {".jpg", ".jpeg", ".png"}
@@ -119,6 +296,12 @@ def validate_upload(file: UploadFile, size_bytes: int) -> None:
             status_code=413,
             detail=f"File exceeds max size of {max_upload_bytes()} bytes",
         )
+
+
+def validate_threshold(value: float, name: str) -> float:
+    if value < 0 or value > 1:
+        raise HTTPException(status_code=422, detail=f"{name} must be between 0 and 1")
+    return float(value)
 
 
 def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
@@ -313,6 +496,8 @@ def delete_project(
 def upload_project_file(
     project_id: UUID,
     file: UploadFile = File(...),
+    conf_threshold: float = Form(0.25),
+    iou_threshold: float = Form(0.45),
     current_user=Depends(get_current_user),
     conn: psycopg2.extensions.connection = Depends(get_conn),
 ):
@@ -329,6 +514,8 @@ def upload_project_file(
     content = file.file.read()
     size_bytes = len(content)
     validate_upload(file, size_bytes)
+    conf_threshold = validate_threshold(conf_threshold, "conf_threshold")
+    iou_threshold = validate_threshold(iou_threshold, "iou_threshold")
 
     ext = Path(file.filename or "").suffix.lower() or ".jpg"
     generated_name = f"{uuid.uuid4().hex}{ext}"
@@ -339,11 +526,11 @@ def upload_project_file(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                INSERT INTO jobs(project_id, status, input_type)
-                VALUES (%s, 'queued', 'image')
-                RETURNING id, status
+                INSERT INTO jobs(project_id, status, input_type, conf_threshold, iou_threshold)
+                VALUES (%s, 'queued', 'image', %s, %s)
+                RETURNING id, status, conf_threshold, iou_threshold
                 """,
-                (str(project_id),),
+                (str(project_id), conf_threshold, iou_threshold),
             )
             job = cur.fetchone()
 
@@ -381,4 +568,130 @@ def upload_project_file(
         file_path=str(target),
         mime_type=file.content_type or "",
         size_bytes=size_bytes,
+        conf_threshold=float(job["conf_threshold"]),
+        iou_threshold=float(job["iou_threshold"]),
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobDetailResponse)
+def get_job(
+    job_id: UUID,
+    current_user=Depends(get_current_user),
+    conn: psycopg2.extensions.connection = Depends(get_conn),
+):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        job = get_owned_job_or_404(cur, job_id, current_user["id"])
+        metrics = fetch_job_metrics(cur, job_id)
+        detections = fetch_job_detections(cur, job_id)
+        assets = fetch_job_assets(cur, job_id)
+
+    return JobDetailResponse(
+        id=job["id"],
+        project_id=job["project_id"],
+        status=job["status"],
+        input_type=job["input_type"],
+        error_message=job["error_message"],
+        conf_threshold=float(job["conf_threshold"]) if job["conf_threshold"] is not None else 0.25,
+        iou_threshold=float(job["iou_threshold"]) if job["iou_threshold"] is not None else 0.45,
+        started_at=job["started_at"],
+        completed_at=job["completed_at"],
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+        metrics=(
+            JobMetricsResponse(
+                tree_count=int(metrics["tree_count"]),
+                avg_confidence=float(metrics["avg_confidence"]),
+                duration_ms=int(metrics["duration_ms"]),
+            )
+            if metrics
+            else None
+        ),
+        detections=detections,
+        assets=JobAssetsResponse(
+            input_image=assets["input_image"],
+            annotated_image=assets["annotated_image"],
+            csv_download_url=f"/jobs/{job_id}/download/csv",
+            json_download_url=f"/jobs/{job_id}/download/json",
+        ),
+    )
+
+
+@app.get("/jobs/{job_id}/download/csv")
+def download_job_csv(
+    job_id: UUID,
+    current_user=Depends(get_current_user),
+    conn: psycopg2.extensions.connection = Depends(get_conn),
+):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        job = get_owned_job_or_404(cur, job_id, current_user["id"])
+        detections = fetch_job_detections(cur, job_id)
+        metrics = fetch_job_metrics(cur, job_id)
+
+    target = csv_artifact_path(job_id)
+    write_detections_csv(target, detections, metrics)
+
+    return FileResponse(
+        path=str(target),
+        media_type="text/csv",
+        filename=f"{job_id}_detections.csv",
+        headers={"X-Artifact-Path": str(target), "X-Job-Status": job["status"]},
+    )
+
+
+@app.get("/jobs/{job_id}/download/json")
+def download_job_json(
+    job_id: UUID,
+    current_user=Depends(get_current_user),
+    conn: psycopg2.extensions.connection = Depends(get_conn),
+):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        job = get_owned_job_or_404(cur, job_id, current_user["id"])
+        detections = fetch_job_detections(cur, job_id)
+        metrics = fetch_job_metrics(cur, job_id)
+
+    target = json_artifact_path(job_id)
+    write_detections_json(target, job, detections, metrics)
+
+    return FileResponse(
+        path=str(target),
+        media_type="application/json",
+        filename=f"{job_id}_detections.json",
+        headers={"X-Artifact-Path": str(target), "X-Job-Status": job["status"]},
+    )
+
+
+@app.get("/jobs/{job_id}/annotated-image")
+def get_job_annotated_image(
+    job_id: UUID,
+    current_user=Depends(get_current_user),
+    conn: psycopg2.extensions.connection = Depends(get_conn),
+):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        _ = get_owned_job_or_404(cur, job_id, current_user["id"])
+        cur.execute(
+            """
+            SELECT file_path, mime_type
+            FROM assets
+            WHERE job_id = %s AND kind = 'annotated'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (str(job_id),),
+        )
+        asset = cur.fetchone()
+
+    if not asset:
+        raise HTTPException(status_code=404, detail="Annotated image not found")
+
+    path = Path(asset["file_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Annotated image file missing on disk")
+
+    media_type = asset["mime_type"] or "image/jpeg"
+    filename = f"{job_id}_annotated{path.suffix or '.jpg'}"
+    return FileResponse(
+        path=str(path),
+        media_type=media_type,
+        filename=filename,
+        headers={"X-Artifact-Path": str(path)},
     )
