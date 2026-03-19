@@ -49,11 +49,14 @@ tree_yolo26s_best.pt
 
 ## 4. GitHub Setup and Clone
 
+Repository URL:
+- `https://github.com/asadozzaman/Tree-counting-End-to-End.git`
+
 ### A) Clone from GitHub (normal use)
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo-name>.git
-cd <your-repo-name>
+git clone https://github.com/asadozzaman/Tree-counting-End-to-End.git
+cd Tree-counting-End-to-End
 ```
 
 ### B) First-time: push this local project to GitHub
@@ -66,7 +69,7 @@ git init
 git add .
 git commit -m "Initial commit: Tree Counting SaaS"
 git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+git remote add origin https://github.com/asadozzaman/Tree-counting-End-to-End.git
 git push -u origin main
 ```
 
