@@ -7,6 +7,7 @@ import uuid
 
 import psycopg2
 import psycopg2.extras
+import redis
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -72,6 +73,14 @@ def database_url() -> str:
     return value
 
 
+def redis_url() -> str:
+    return os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+
+def job_queue_key() -> str:
+    return os.getenv("JOB_QUEUE_KEY", "jobs:queue")
+
+
 def jwt_secret() -> str:
     return os.getenv("JWT_SECRET", "dev-only-secret-change-me")
 
@@ -89,7 +98,7 @@ def max_upload_bytes() -> int:
 
 
 def uploads_dir() -> Path:
-    root = Path(os.getenv("UPLOAD_DIR", "/app/uploads"))
+    root = Path(os.getenv("UPLOAD_DIR", "/shared/uploads"))
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -118,6 +127,10 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         yield conn
     finally:
         conn.close()
+
+
+def get_redis_client() -> redis.Redis:
+    return redis.Redis.from_url(redis_url(), decode_responses=True)
 
 
 def validate_email(email: str) -> str:
@@ -343,6 +356,22 @@ def upload_project_file(
                 (str(project_id), job["id"], str(target), file.content_type, size_bytes),
             )
             asset = cur.fetchone()
+
+    queue = get_redis_client()
+    try:
+        queue.rpush(job_queue_key(), str(job["id"]))
+    except Exception as exc:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'failed', error_message = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (f"Queue publish failed: {exc}", str(job["id"])),
+                )
+        raise HTTPException(status_code=503, detail="Failed to queue job")
 
     return UploadResponse(
         job_id=job["id"],

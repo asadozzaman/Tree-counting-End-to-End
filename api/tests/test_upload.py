@@ -56,8 +56,14 @@ def test_upload_valid_creates_job_and_asset_records():
     headers = {"Authorization": f"Bearer {token}"}
     project_id = _create_project(headers)
 
+    # Valid 1x1 PNG
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDAT\x08\x1dc\xf8\xff"
+        b"\xff?\x00\x05\xfe\x02\xfeA\xe2&\x05\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
     files = {
-        "file": ("sample.jpg", b"\xff\xd8\xff\xdbfakejpeg", "image/jpeg")
+        "file": ("sample.png", png_bytes, "image/png")
     }
     upload = client.post(f"/projects/{project_id}/upload", files=files, headers=headers)
     assert upload.status_code == 201
@@ -69,7 +75,7 @@ def test_upload_valid_creates_job_and_asset_records():
             cur.execute("SELECT status FROM jobs WHERE id = %s", (payload["job_id"],))
             row = cur.fetchone()
             assert row is not None
-            assert row[0] == "queued"
+            assert row[0] in {"queued", "running", "done"}
 
             cur.execute("SELECT kind, job_id FROM assets WHERE id = %s", (payload["asset_id"],))
             row = cur.fetchone()
