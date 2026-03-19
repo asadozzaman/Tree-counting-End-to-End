@@ -1,11 +1,13 @@
 ﻿import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Generator, Optional
 from uuid import UUID
+import uuid
 
 import psycopg2
 import psycopg2.extras
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -53,6 +55,16 @@ class DeleteResponse(BaseModel):
     id: UUID
 
 
+class UploadResponse(BaseModel):
+    job_id: UUID
+    asset_id: UUID
+    project_id: UUID
+    status: str
+    file_path: str
+    mime_type: str
+    size_bytes: int
+
+
 def database_url() -> str:
     value = os.getenv("DATABASE_URL")
     if not value:
@@ -70,6 +82,34 @@ def jwt_algorithm() -> str:
 
 def jwt_expiry_minutes() -> int:
     return int(os.getenv("JWT_EXPIRE_MINUTES", "120"))
+
+
+def max_upload_bytes() -> int:
+    return int(os.getenv("MAX_UPLOAD_BYTES", "10485760"))
+
+
+def uploads_dir() -> Path:
+    root = Path(os.getenv("UPLOAD_DIR", "/app/uploads"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def validate_upload(file: UploadFile, size_bytes: int) -> None:
+    allowed_mime = {"image/jpeg", "image/png"}
+    allowed_ext = {".jpg", ".jpeg", ".png"}
+    ext = Path(file.filename or "").suffix.lower()
+
+    if file.content_type not in allowed_mime or ext not in allowed_ext:
+        raise HTTPException(status_code=415, detail="Only JPG and PNG files are allowed")
+
+    if size_bytes <= 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    if size_bytes > max_upload_bytes():
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds max size of {max_upload_bytes()} bytes",
+        )
 
 
 def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
@@ -254,3 +294,62 @@ def delete_project(
     if not deleted:
         raise HTTPException(status_code=404, detail="Project not found")
     return DeleteResponse(deleted=True, id=deleted["id"])
+
+
+@app.post("/projects/{project_id}/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
+def upload_project_file(
+    project_id: UUID,
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    conn: psycopg2.extensions.connection = Depends(get_conn),
+):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id FROM projects WHERE id = %s AND user_id = %s",
+            (str(project_id), current_user["id"]),
+        )
+        project = cur.fetchone()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    content = file.file.read()
+    size_bytes = len(content)
+    validate_upload(file, size_bytes)
+
+    ext = Path(file.filename or "").suffix.lower() or ".jpg"
+    generated_name = f"{uuid.uuid4().hex}{ext}"
+    target = uploads_dir() / generated_name
+    target.write_bytes(content)
+
+    with conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs(project_id, status, input_type)
+                VALUES (%s, 'queued', 'image')
+                RETURNING id, status
+                """,
+                (str(project_id),),
+            )
+            job = cur.fetchone()
+
+            cur.execute(
+                """
+                INSERT INTO assets(project_id, job_id, kind, file_path, mime_type, size_bytes)
+                VALUES (%s, %s, 'input', %s, %s, %s)
+                RETURNING id
+                """,
+                (str(project_id), job["id"], str(target), file.content_type, size_bytes),
+            )
+            asset = cur.fetchone()
+
+    return UploadResponse(
+        job_id=job["id"],
+        asset_id=asset["id"],
+        project_id=project_id,
+        status=job["status"],
+        file_path=str(target),
+        mime_type=file.content_type or "",
+        size_bytes=size_bytes,
+    )
