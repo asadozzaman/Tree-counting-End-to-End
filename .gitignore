@@ -1,4 +1,4 @@
-﻿# Monorepo
+# Monorepo
 node_modules/
 .next/
 __pycache__/
@@ -7,3 +7,9 @@ __pycache__/
 .env.local
 venv/
 .venv/
+
+# Local build state and generated test artifacts
+.docker-temp/
+tmp_logs/
+tmp_upload/
+.pytest_cache/

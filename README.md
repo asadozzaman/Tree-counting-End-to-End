@@ -1,266 +1,92 @@
-# Tree Counting SaaS (Full Project Guide)
+# Tree Counting — End-to-End CV Application
 
-End-to-end SaaS project for tree detection/counting with:
-- **Next.js frontend** (login/register, projects, upload, jobs table, result detail)
-- **FastAPI backend** (auth, projects, uploads, jobs, artifact downloads)
-- **Worker service** (YOLO inference queue consumer)
-- **PostgreSQL** (app data)
-- **Redis** (job queue)
+**Image upload → queued inference → inspectable results**
 
-Model used by worker:
-- `tree_yolo26s_best.pt`
+[![Worker unit tests](https://github.com/asadozzaman/Tree-counting-End-to-End/actions/workflows/ci.yml/badge.svg)](https://github.com/asadozzaman/Tree-counting-End-to-End/actions/workflows/ci.yml)
 
----
+A full-stack tree-detection application built with Next.js, FastAPI, PostgreSQL, Redis, and a YOLO worker. It demonstrates the application around a model: users, projects, uploads, background jobs, status, and downloadable evidence.
 
-## 1. What This Project Does
+**Status:** local application implementation. Published model-accuracy benchmarks, load tests, and production deployment validation are not included.
 
-You can:
-1. Register/login
-2. Create projects
-3. Upload JPG/PNG images
-4. Queue inference jobs
-5. Track job status (`queued -> running -> done/failed`)
-6. View result details (tree count, confidence, duration)
-7. Download results as CSV/JSON
-8. View annotated output image
+[Run locally](docs/setup.md) · [API implementation](api/app/main.py) · [Inference worker](worker/app/worker.py) · [Database migrations](api/db/migrations)
 
----
+## User workflow
 
-## 2. Tech Stack
+1. Register or sign in and create a project.
+2. Upload a JPG/PNG image with confidence and NMS IoU thresholds.
+3. Follow the job through queued, running, and completed/failed states.
+4. Review the annotated image, detection count, mean confidence, and duration.
+5. Download CSV/JSON results for further inspection.
 
-- Frontend: Next.js 14 (App Router, TypeScript)
-- API: FastAPI + PostgreSQL + Redis
-- Worker: Python + Ultralytics YOLO
-- Infra: Docker Compose
+The displayed count is the number of detections returned by the configured model and thresholds. Mean confidence is **not a measured accuracy score**.
 
----
+## Architecture
 
-## 3. Project Structure
-
-```text
-frontend/   # Next.js UI
-api/        # FastAPI app + migrations + tests + scripts
-worker/     # Inference worker + metrics tests
-docker-compose.yml
-tree_yolo26s_best.pt
+```mermaid
+flowchart TD
+    U["Next.js interface"] --> A["FastAPI: auth, projects, uploads"]
+    A --> P["PostgreSQL: jobs and results"]
+    A --> Q["Redis job queue"]
+    A --> F["Shared upload storage"]
+    Q --> W["YOLO worker"]
+    F --> W
+    W --> P
+    W --> F
+    A --> R["Status + CSV / JSON / image downloads"]
+    R --> U
 ```
 
----
+| Boundary | Why it exists |
+| --- | --- |
+| API → queue | Accept work separately from the inference process |
+| Worker → database | Persist job state, detections, and per-job metrics |
+| API + worker → shared volume | Let both processes access input files and generated artifacts |
+| API → authenticated user | Associate uploads and results with projects and users |
 
-## 4. GitHub Setup and Clone
+See [`docker-compose.yml`](docker-compose.yml) for the actual local service wiring. This is a local Compose topology, not a claimed distributed deployment.
 
-Repository URL:
-- `https://github.com/asadozzaman/Tree-counting-End-to-End.git`
+## Quick start
 
-### A) Clone from GitHub (normal use)
+Prerequisites: Git, Docker with Compose, and the configured model file.
 
 ```bash
 git clone https://github.com/asadozzaman/Tree-counting-End-to-End.git
 cd Tree-counting-End-to-End
-```
-
-### B) First-time: push this local project to GitHub
-
-1. Create an empty GitHub repo in your account.
-2. In local project root:
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: Tree Counting SaaS"
-git branch -M main
-git remote add origin https://github.com/asadozzaman/Tree-counting-End-to-End.git
-git push -u origin main
-```
-
-After this, anyone can clone with the command in section A.
-
----
-
-## 5. Prerequisites
-
-- Git
-- Docker Desktop (with Compose)
-
-Optional for non-Docker local run:
-- Python 3.12+
-- Node.js 20+
-
----
-
-## 6. Environment Variables
-
-Current examples are already included:
-- `api/.env.example`
-- `worker/.env.example`
-- `frontend/.env.example`
-
-Defaults are already wired for Docker Compose.
-
-Important:
-- Worker model path is `/models/tree_yolo26s_best.pt`
-- Compose mounts root model file:
-  - `./tree_yolo26s_best.pt:/models/tree_yolo26s_best.pt:ro`
-
----
-
-## 7. Run with Docker (Recommended)
-
-From repo root:
-
-```bash
 docker compose up -d --build
-```
-
-Services:
-- Frontend: http://localhost:3000
-- API: http://localhost:8000
-- API docs: http://localhost:8000/docs
-
-Check status:
-
-```bash
-docker compose ps
-```
-
----
-
-## 8. Database Setup (Migrations + Seed + Sanity)
-
-Apply migrations:
-
-```bash
 docker compose exec -T api python scripts/apply_migrations.py
 ```
 
-Seed sample data:
+Open **http://localhost:3000** for the interface and **http://localhost:8000/docs** for the API. Compose currently loads the included example environments and mounts `tree_yolo26s_best.pt` read-only into the worker. Use trusted weights that you have permission to use; review model and training-data rights before redistribution or commercial use.
+
+The [full setup guide](docs/setup.md) includes migrations, optional seed data, smoke scripts, endpoint reference, troubleshooting, and non-Docker startup.
+
+## Verification
+
+Worker metrics unit tests require neither the model nor a GPU:
 
 ```bash
-docker compose exec -T api python scripts/seed_data.py
+python -m pip install pytest==8.3.4
+cd worker
+python -m pytest -q tests/test_metrics.py
 ```
 
-Sanity checks:
+GitHub Actions runs these unit tests and compiles the API/worker Python files. It does **not** run model inference or the full application.
 
-```bash
-docker compose exec -T api python scripts/db_sanity.py
-```
-
----
-
-## 9. Run Tests
-
-API tests:
+For API integration tests against your isolated local Compose database:
 
 ```bash
 docker compose exec -T api python -m pytest -q
 ```
 
-Worker unit tests:
+**Use a disposable test database:** the current API tests truncate application tables. The [smoke scripts](api/scripts) exercise queue processing and artifact downloads separately.
 
-```bash
-docker compose exec -T worker python -m pytest -q tests/test_metrics.py
-```
+## Current limitations and next work
 
-Frontend production build check (one-off container):
+- **Model evaluation:** publish labeled test-set provenance, precision/recall, counting error, and representative failures.
+- **Queue reliability:** add and test retries, recovery after worker crashes, and idempotent processing.
+- **Deployment:** replace development credentials, add HTTPS and access/retention controls, and validate the complete stack before external use.
+- **Startup:** move the worker's runtime OS-package installation into its image build.
+- **Repository hygiene:** temporary build files and sample uploads need a provenance/cleanup review.
+- **Demo:** capture a reproducible end-to-end walkthrough using redistributable sample images.
 
-```bash
-docker compose run --rm frontend npm run build
-```
-
----
-
-## 10. UI Workflow
-
-1. Open http://localhost:3000
-2. Register or login
-3. Create a project
-4. Open Upload page for that project
-5. Upload image + thresholds (`conf`, `iou`)
-6. Open Jobs table
-7. Open result detail page
-8. Download CSV/JSON and view annotated image
-
-Note:
-- Jobs table tracks job IDs in browser local storage for that project.
-
----
-
-## 11. Key API Endpoints
-
-Auth:
-- `POST /auth/register`
-- `POST /auth/login`
-
-Projects:
-- `GET /projects`
-- `POST /projects`
-- `GET /projects/{id}`
-- `DELETE /projects/{id}`
-
-Upload + Jobs:
-- `POST /projects/{id}/upload`
-- `GET /jobs/{id}`
-- `GET /jobs/{id}/download/csv`
-- `GET /jobs/{id}/download/json`
-- `GET /jobs/{id}/annotated-image`
-
----
-
-## 12. Artifacts and Outputs
-
-Generated artifacts are stored under shared volume paths like:
-- `/shared/uploads/artifacts/<job_id>_detections.csv`
-- `/shared/uploads/artifacts/<job_id>_detections.json`
-- `/shared/uploads/artifacts/<job_id>_annotated.jpg`
-
----
-
-## 13. Useful Smoke Scripts
-
-Run from API container:
-
-```bash
-python scripts/inference_samples.py
-python scripts/jobs_artifacts_smoke.py
-```
-
-These verify queue processing, job completion, and downloadable artifacts.
-
----
-
-## 14. Troubleshooting
-
-- If frontend behaves strangely after route/file changes, restart frontend:
-
-```bash
-docker compose restart frontend
-```
-
-- If worker is slow to start after restart:
-  - It installs OS libs at startup (current compose command), so initial boot may take time.
-
-- If model load fails:
-  - Ensure `tree_yolo26s_best.pt` exists in repo root.
-
----
-
-## 15. Local Run Without Docker (Optional)
-
-From each service directory:
-
-- API:
-```bash
-python -m uvicorn app.main:app --reload --port 8000
-```
-
-- Worker:
-```bash
-python -m app.worker
-```
-
-- Frontend:
-```bash
-npm run dev
-```
-
-You must run PostgreSQL + Redis separately and set env vars accordingly.
+Built by [Md. Asadozzaman](https://github.com/asadozzaman), Senior AI Engineer focused on Computer Vision and production AI systems.
